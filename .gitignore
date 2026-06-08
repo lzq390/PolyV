@@ -1,0 +1,8 @@
+.codex_video_analysis/
+.codex_tmp_video_analysis.py
+__pycache__/
+*.pyc
+result.json
+.venv/
+
+outputs/
