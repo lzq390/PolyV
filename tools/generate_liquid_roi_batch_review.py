@@ -18,7 +18,6 @@ from polyv_detector.detector import DEFAULT_CONFIG, GelClimbDetector
 
 COLORS = {
     "liquid_roi": (0, 180, 255),
-    "sparse_roi": (255, 0, 255),
     "rod_roi": (0, 255, 0),
     "shaft_core_exclusion": (0, 0, 255),
 }
@@ -146,7 +145,7 @@ def draw_overlay(frame: np.ndarray, result, index: int, path: Path) -> np.ndarra
     evidence = result.evidence
     rois = evidence.get("rois") or {}
 
-    for name in ("liquid_roi", "sparse_roi", "rod_roi", "shaft_core_exclusion"):
+    for name in ("liquid_roi", "rod_roi", "shaft_core_exclusion"):
         rect = rois.get(name)
         if not rect or len(rect) != 4:
             continue

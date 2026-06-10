@@ -26,7 +26,7 @@ class DetectionConfig:
     shaft_core_exclusion: Rect = Rect(0.64, 0.36, 0.68, 0.90)
 
     roi_mode: str = "fixed"
-    calibration_duration_sec: float = 20.0
+    calibration_duration_sec: float = 30.0
     baseline_duration_sec: float = 60.0
     metric_smooth_sec: float = 10.0
     roi_quality_min: float = 0.60
@@ -83,11 +83,12 @@ class RoiSet:
     def rects_dict(self) -> dict[str, list[float]]:
         rects = {
             "liquid_roi": _rect_to_list(self.liquid_roi),
-            "sparse_roi": _rect_to_list(self.sparse_roi),
             "rod_roi": _rect_to_list(self.rod_roi),
         }
-        if self.source == "fixed" and self.shaft_core_exclusion is not None:
-            rects["shaft_core_exclusion"] = _rect_to_list(self.shaft_core_exclusion)
+        if self.source == "fixed":
+            rects["sparse_roi"] = _rect_to_list(self.sparse_roi)
+            if self.shaft_core_exclusion is not None:
+                rects["shaft_core_exclusion"] = _rect_to_list(self.shaft_core_exclusion)
         return rects
 
 
@@ -154,8 +155,6 @@ class BaselineModel:
             "baseline_connected_area_iqr": round(self.connected_area_iqr, 4),
             "baseline_white_coverage": round(self.white_coverage, 4),
             "baseline_white_coverage_iqr": round(self.white_coverage_iqr, 4),
-            "baseline_sparse_hole_ratio": round(self.sparse_hole_ratio, 4),
-            "baseline_sparse_hole_iqr": round(self.sparse_hole_iqr, 4),
             "initial_final_like": bool(self.initial_final_like),
         }
 
@@ -184,7 +183,6 @@ class FrameMetrics:
     def to_dict(self) -> dict:
         payload = {
             "white_coverage": round(float(self.white_coverage), 4),
-            "sparse_hole_ratio": round(float(self.sparse_hole_ratio), 4),
             "rod_wrap_height_px": int(self.rod_wrap_height_px),
             "rod_wrap_ratio": round(float(self.rod_wrap_ratio), 4),
             "connected_area_ratio": round(float(self.connected_area_ratio), 4),
@@ -195,6 +193,8 @@ class FrameMetrics:
             "roi_quality": round(float(self.roi_quality), 4),
             "roi_failure_reason": self.roi_failure_reason,
         }
+        if self.roi_source == "fixed":
+            payload["sparse_hole_ratio"] = round(float(self.sparse_hole_ratio), 4)
         if self.rois is not None:
             payload["rois"] = self.rois
         if self.roi_scores is not None:
@@ -207,7 +207,7 @@ class FrameMetrics:
             payload["connected_area_delta_ratio"] = round(float(self.connected_area_delta_ratio), 4)
         if self.white_coverage_delta is not None:
             payload["white_coverage_delta"] = round(float(self.white_coverage_delta), 4)
-        if self.sparse_hole_delta is not None:
+        if self.roi_source == "fixed" and self.sparse_hole_delta is not None:
             payload["sparse_hole_delta"] = round(float(self.sparse_hole_delta), 4)
         return payload
 
@@ -373,7 +373,7 @@ class GelClimbDetector:
                     },
                 )
             if self._roi_tracker is None:
-                self._roi_tracker = DynamicRoiTracker.calibrate(self._calibration_frames, self.config)
+                self._roi_tracker = DynamicRoiTracker.calibrate(self._roi_calibration_frames(), self.config)
                 self._last_roi_update_sec = None
             assert self._roi_tracker is not None
             baseline_duration_sec = max(self.config.baseline_duration_sec, self.config.calibration_duration_sec)
@@ -408,22 +408,20 @@ class GelClimbDetector:
 
     def _calibrate_dynamic(self) -> None:
         if self._roi_tracker is None:
-            self._roi_tracker = DynamicRoiTracker.calibrate(self._calibration_frames, self.config)
+            self._roi_tracker = DynamicRoiTracker.calibrate(self._roi_calibration_frames(), self.config)
             self._last_roi_update_sec = None
         rois = self._roi_tracker.rois()
         baseline_metrics = [detect_frame(frame, self.config, rois=rois) for frame in self._calibration_frames]
         self._baseline = _build_baseline(baseline_metrics, rois, self.config)
 
+    def _roi_calibration_frames(self) -> list[np.ndarray]:
+        if self.config.calibration_duration_sec < 10.0 or len(self._calibration_frames) < 9:
+            return self._calibration_frames
+        tail_count = max(3, len(self._calibration_frames) // 3)
+        return self._calibration_frames[-tail_count:]
+
     def _dynamic_rois_for_frame(self, frame: np.ndarray, timestamp_sec: float) -> RoiSet:
         assert self._roi_tracker is not None
-        interval = max(0.0, self.config.dynamic_roi_update_interval_sec)
-        should_update = (
-            self._last_roi_update_sec is None
-            or timestamp_sec - self._last_roi_update_sec >= interval
-        )
-        if should_update:
-            self._last_roi_update_sec = timestamp_sec
-            return self._roi_tracker.update_liquid(frame)
         return self._roi_tracker.rois()
 
     def _update_stable_state(self, metrics: FrameMetrics, timestamp_sec: float) -> DetectionResult:
@@ -554,11 +552,9 @@ def _dynamic_final_candidate(metrics: FrameMetrics, baseline: BaselineModel, con
         return False
     connected_delta_min = max(config.connected_area_delta_ratio_min, baseline.connected_area_iqr)
     white_delta_min = max(0.04, 2.0 * baseline.white_coverage_iqr)
-    sparse_delta_min = max(0.05, 2.0 * baseline.sparse_hole_iqr)
     white_delta = metrics.white_coverage_delta or 0.0
-    sparse_delta = metrics.sparse_hole_delta or 0.0
     connected_delta = metrics.connected_area_delta_ratio or 0.0
-    appearance_delta_ok = operator.ge(white_delta, white_delta_min) or operator.ge(sparse_delta, sparse_delta_min)
+    appearance_delta_ok = operator.ge(white_delta, white_delta_min)
     return (
         operator.ge(metrics.rod_wrap_ratio, config.rod_wrap_ratio_min)
         and operator.ge(metrics.connected_area_ratio, config.connected_area_ratio_min)
@@ -608,29 +604,18 @@ def _detect_single_geometry(frame: np.ndarray, config: DetectionConfig) -> RoiGe
         bright_mask = (gray >= 145).astype(np.uint8)
         edges = _simple_edges(gray)
 
-    expected_x_norm = (config.shaft_core_exclusion.x0 + config.shaft_core_exclusion.x1) * 0.5
-    expected_x = expected_x_norm * width
-    hough_x, hough_score = _hough_shaft_x(edges, width, height, expected_x)
-    col_score = bright_mask.mean(axis=0) + 0.35 * (edges > 0).mean(axis=0)
-    col_score = _smooth_1d(col_score, max(7, width // 120))
-    search_half = int(round(width * 0.12))
-    search_x0 = max(0, int(round(expected_x)) - search_half)
-    search_x1 = min(width, int(round(expected_x)) + search_half)
-    xs = np.arange(width, dtype=float)
-    center_prior = np.clip(1.0 - np.abs(xs - expected_x) / max(1.0, width * 0.10), 0.0, 1.0)
-    centered_col_score = col_score * (0.20 + 0.80 * center_prior)
-    fallback_x = float(search_x0 + np.argmax(centered_col_score[search_x0:search_x1]))
-    shaft_x = fallback_x if hough_x is None else float(0.70 * hough_x + 0.30 * fallback_x)
+    liquid_x0, liquid_y0, liquid_x1, liquid_y1, liquid_ellipse_score = _detect_liquid_ellipse_bounds(
+        frame,
+        config,
+    )
+    shaft_x, shaft_width, rod_column_score = _detect_liquid_guided_rod_axis(
+        bright_mask=bright_mask,
+        edges=edges,
+        liquid_bounds=(liquid_x0, liquid_y0, liquid_x1, liquid_y1),
+        width=width,
+        height=height,
+    )
     shaft_x_i = int(round(_clamp(shaft_x, 0, width - 1)))
-    peak = float(col_score[shaft_x_i])
-    threshold = max(float(np.percentile(col_score, 82)), peak * 0.45)
-    left = shaft_x_i
-    right = shaft_x_i
-    while left > 0 and col_score[left - 1] >= threshold:
-        left -= 1
-    while right + 1 < width and col_score[right + 1] >= threshold:
-        right += 1
-    shaft_width = float(_clamp(right - left + 1, 6, max(8, width * 0.05)))
 
     band_half = int(max(6, shaft_width * 1.8))
     bx0 = max(0, shaft_x_i - band_half)
@@ -641,19 +626,15 @@ def _detect_single_geometry(frame: np.ndarray, config: DetectionConfig) -> RoiGe
         rod_top = float(np.percentile(active_rows, 5))
         rod_bottom = float(np.percentile(active_rows, 95))
     else:
-        rod_top = height * 0.30
-        rod_bottom = height * 0.95
+        liquid_height = max(1.0, liquid_y1 - liquid_y0)
+        rod_top = max(0.0, liquid_y0 - liquid_height * 1.30)
+        rod_bottom = min(height, liquid_y1)
 
-    liquid_x0, liquid_y0, liquid_x1, liquid_y1, liquid_ellipse_score = _detect_liquid_ellipse_bounds(
-        frame,
-        config,
-    )
     bottle_left, bottle_right, bottle_detected = _detect_bottle_bounds(edges, shaft_x_i, width, height)
     bottle_bottom = height * 0.95
     bottle_alignment = _bottle_alignment_score(bottle_left, bottle_right, shaft_x, width, bottle_detected)
     length_score = _clamp01((rod_bottom - rod_top) / max(1.0, height * 0.35))
-    peak_score = _clamp01(peak / 0.22)
-    rod_axis_score = _clamp01(0.45 * length_score + 0.35 * peak_score + 0.20 * hough_score)
+    rod_axis_score = _clamp01(0.75 * rod_column_score + 0.25 * length_score)
     return RoiGeometry(
         shaft_x_px=shaft_x,
         shaft_width_px=shaft_width,
@@ -677,6 +658,55 @@ def _detect_single_geometry(frame: np.ndarray, config: DetectionConfig) -> RoiGe
     )
 
 
+def _detect_liquid_guided_rod_axis(
+    bright_mask: np.ndarray,
+    edges: np.ndarray,
+    liquid_bounds: tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> tuple[float, float, float]:
+    liquid_x0, liquid_y0, liquid_x1, liquid_y1 = liquid_bounds
+    liquid_center_x = 0.5 * (liquid_x0 + liquid_x1)
+    liquid_height = max(1.0, liquid_y1 - liquid_y0)
+    fallback_width = float(_clamp(width * 0.012, 6, max(8, width * 0.05)))
+    search_x0 = int(round(_clamp(liquid_x0 - width * 0.08, 0, width - 2)))
+    search_x1 = int(round(_clamp(liquid_x1 + width * 0.20, search_x0 + 2, width)))
+    search_y0 = int(round(_clamp(liquid_y0 - liquid_height * 2.40, 0, height - 2)))
+    search_y1 = int(round(_clamp(liquid_y0 - liquid_height * 0.20, search_y0 + 2, height)))
+    if search_y1 <= search_y0 + 4 or search_x1 <= search_x0 + 4:
+        return liquid_center_x, fallback_width, 0.0
+
+    edge_crop = (edges[search_y0:search_y1, search_x0:search_x1] > 0).astype(float)
+    bright_crop = bright_mask[search_y0:search_y1, search_x0:search_x1].astype(float)
+    if edge_crop.size == 0 or bright_crop.size == 0:
+        return liquid_center_x, fallback_width, 0.0
+
+    column_score = 0.65 * edge_crop.mean(axis=0) + 0.35 * bright_crop.mean(axis=0)
+    column_score = _smooth_1d(column_score, max(9, width // 160))
+    if column_score.size == 0 or float(column_score.max()) <= 0.0:
+        return liquid_center_x, fallback_width, 0.0
+
+    xs = (search_x0 + np.arange(column_score.size, dtype=float)) / max(1, width)
+    center_prior = np.clip(
+        1.0 - np.abs(xs - liquid_center_x / max(1, width)) / 0.28,
+        0.20,
+        1.0,
+    )
+    weighted = column_score * center_prior
+    best_idx = int(np.argmax(weighted))
+    shaft_x = float(search_x0 + best_idx)
+    peak = float(column_score[best_idx])
+    threshold = max(float(np.percentile(column_score, 80)), peak * 0.50)
+    left = best_idx
+    right = best_idx
+    while left > 0 and column_score[left - 1] >= threshold:
+        left -= 1
+    while right + 1 < column_score.size and column_score[right + 1] >= threshold:
+        right += 1
+    shaft_width = float(_clamp(right - left + 1, 6, max(8, width * 0.05)))
+    return shaft_x, shaft_width, _clamp01(float(weighted[best_idx]) / 0.35)
+
+
 def _detect_liquid_ellipse_bounds(frame: np.ndarray, config: DetectionConfig) -> tuple[float, float, float, float, float]:
     height, width = frame.shape[:2]
     fallback = _rect_px(config.liquid_roi, width, height)
@@ -685,9 +715,12 @@ def _detect_liquid_ellipse_bounds(frame: np.ndarray, config: DetectionConfig) ->
         return (*[float(v) for v in fallback], 0.0)
 
     milk_mask = _milky_liquid_mask(frame, cv2).astype(np.uint8)
+    component = _detect_liquid_component_box(frame, milk_mask, width, height, cv2)
     broad = _detect_broad_liquid_ellipse_window(milk_mask, width, height, cv2)
     compact = _detect_compact_liquid_ellipse_window(frame, milk_mask, width, height, cv2)
 
+    if component is not None:
+        return component
     if broad is not None and _prefer_broad_liquid_box(broad, compact, width, height):
         return broad
     if compact is not None:
@@ -695,6 +728,124 @@ def _detect_liquid_ellipse_bounds(frame: np.ndarray, config: DetectionConfig) ->
     if broad is not None:
         return broad
     return (*[float(v) for v in fallback], 0.0)
+
+
+def _detect_liquid_component_box(
+    frame: np.ndarray,
+    milk_mask: np.ndarray,
+    width: int,
+    height: int,
+    cv2,
+) -> tuple[float, float, float, float, float] | None:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+    gray = _rgb_to_gray(frame)
+    edges = cv2.Canny(gray.astype(np.uint8), 50, 150)
+    soft_mask = _soft_milky_liquid_mask(frame, cv2).astype(np.uint8)
+    core_mask = milk_mask.astype(np.uint8)
+    search_x0 = int(round(width * 0.10))
+    search_x1 = int(round(width * 0.90))
+    search_y0 = int(round(height * 0.25))
+    search_y1 = int(round(height * 0.96))
+    if search_x1 <= search_x0 + 4 or search_y1 <= search_y0 + 4:
+        return None
+
+    search_mask = soft_mask[search_y0:search_y1, search_x0:search_x1].copy()
+    kernel_size = max(3, int(round(width / 240)))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    search_mask = cv2.morphologyEx(search_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    search_mask = cv2.morphologyEx(search_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(search_mask, 8)
+    if num_labels <= 1:
+        return None
+
+    shaft_x, shaft_score = _estimate_global_shaft_axis(frame, edges, width, height, cv2)
+    best: tuple[float, int, int, int, int] | None = None
+    for label in range(1, num_labels):
+        local_x, local_y, local_w, local_h, area = [int(v) for v in stats[label]]
+        if area < width * height * 0.001:
+            continue
+        x0 = search_x0 + local_x
+        y0 = search_y0 + local_y
+        x1 = x0 + local_w
+        y1 = y0 + local_h
+        width_norm = local_w / max(1, width)
+        height_norm = local_h / max(1, height)
+        if not (0.06 <= width_norm <= 0.65 and 0.035 <= height_norm <= 0.45):
+            continue
+        component_mask = (labels[local_y:local_y + local_h, local_x:local_x + local_w] == label).astype(np.uint8)
+        score = _score_liquid_component(
+            component_mask,
+            area,
+            x0,
+            y0,
+            x1,
+            y1,
+            width,
+            height,
+            shaft_x,
+            shaft_score,
+            hsv,
+            edges,
+        )
+        if best is None or score > best[0]:
+            best = (score, x0, y0, x1, y1)
+
+    if best is None or best[0] < 0.52:
+        return None
+
+    score, x0, y0, x1, y1 = best
+    x0, y0, x1, y1 = _refine_liquid_bounds_from_mask(
+        soft_mask,
+        core_mask,
+        hsv,
+        edges,
+        x0,
+        y0,
+        x1,
+        y1,
+        width,
+        height,
+        shaft_x=shaft_x,
+    )
+    if y0 / max(1, height) > 0.56 or y1 / max(1, height) > 0.74:
+        return None
+    return (float(x0), float(y0), float(x1), float(y1), float(score))
+
+
+def _score_liquid_component(
+    component_mask: np.ndarray,
+    area: int,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    width: int,
+    height: int,
+    shaft_x: float,
+    shaft_score: float,
+    hsv: np.ndarray,
+    edges: np.ndarray,
+) -> float:
+    box_area = max(1, (x1 - x0) * (y1 - y0))
+    area_norm = area / max(1.0, width * height)
+    density = area / box_area
+    ellipse_density, corner_density = _ellipse_window_density(component_mask)
+    ellipse_gain = _clamp01((ellipse_density - corner_density + 0.12) / 0.40)
+    shaft_relation = _shaft_liquid_relation_score(shaft_x, shaft_score, x0, x1, width)
+    center_x = 0.5 * (x0 + x1) / max(1, width)
+    center_score = _clamp01(1.0 - abs(center_x - 0.50) / 0.34)
+    label_penalty = _label_like_penalty(hsv, edges, x0, y0, x1, y1)
+    return _clamp01(
+        0.22 * _clamp01(area_norm / 0.035)
+        + 0.18 * density
+        + 0.16 * ellipse_density
+        + 0.14 * ellipse_gain
+        + 0.14 * shaft_relation
+        + 0.08 * center_score
+        - 0.20 * label_penalty
+    )
 
 
 def _detect_broad_liquid_ellipse_window(
@@ -720,8 +871,8 @@ def _detect_broad_liquid_ellipse_window(
 
     integral = cv2.integral(search_mask)
     search_h, search_w = search_mask.shape
-    x_step = max(4, int(round(width * 0.015)))
-    y_step = max(4, int(round(height * 0.015)))
+    x_step = max(6, int(round(width * 0.025)))
+    y_step = max(6, int(round(height * 0.025)))
     width_ratios = (0.24, 0.28, 0.30, 0.34, 0.38, 0.42, 0.44)
     height_ratios = (0.16, 0.20, 0.23, 0.26, 0.29, 0.30)
     coarse_candidates: list[tuple[float, int, int, int, int, float]] = []
@@ -816,9 +967,9 @@ def _detect_compact_liquid_ellipse_window(
     height: int,
     cv2,
 ) -> tuple[float, float, float, float, float] | None:
-    search_x0 = int(round(width * 0.18))
-    search_x1 = int(round(width * 0.84))
-    search_y0 = int(round(height * 0.62))
+    search_x0 = int(round(width * 0.12))
+    search_x1 = int(round(width * 0.88))
+    search_y0 = int(round(height * 0.28))
     search_y1 = int(round(height * 0.94))
     if search_x1 <= search_x0 or search_y1 <= search_y0:
         return None
@@ -840,6 +991,9 @@ def _detect_compact_liquid_ellipse_window(
         & (b >= 125)
         & (channel_span <= 85)
     ).astype(np.uint8)
+    gray = _rgb_to_gray(frame)
+    edges = cv2.Canny(gray.astype(np.uint8), 50, 150)
+    shaft_x, shaft_score = _estimate_global_shaft_axis(frame, edges, width, height, cv2)
 
     masks = (core_mask, milk_mask)
     kernel_size = max(3, int(round(width / 360)))
@@ -847,11 +1001,11 @@ def _detect_compact_liquid_ellipse_window(
         kernel_size += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
 
-    best: tuple[float, int, int, int, int] | None = None
-    width_ratios = (0.20, 0.24, 0.28, 0.30, 0.32, 0.34)
-    height_ratios = (0.12, 0.16, 0.18, 0.20)
-    x_step = max(4, int(round(width * 0.015)))
-    y_step = max(4, int(round(height * 0.015)))
+    candidates: list[tuple[float, int, int, int, int]] = []
+    width_ratios = (0.14, 0.18, 0.20, 0.24, 0.28, 0.30, 0.32, 0.34)
+    height_ratios = (0.08, 0.10, 0.12, 0.16, 0.18, 0.20)
+    x_step = max(6, int(round(width * 0.025)))
+    y_step = max(6, int(round(height * 0.025)))
 
     for base_mask in masks:
         search_mask = base_mask[search_y0:search_y1, search_x0:search_x1].copy()
@@ -859,6 +1013,7 @@ def _detect_compact_liquid_ellipse_window(
         search_mask = cv2.morphologyEx(search_mask, cv2.MORPH_OPEN, kernel, iterations=1)
         integral = cv2.integral(search_mask)
         search_h, search_w = search_mask.shape
+        coarse_candidates: list[tuple[float, int, int, int, int, float, float, float, float, float]] = []
 
         for window_w in {max(4, int(round(width * ratio))) for ratio in width_ratios}:
             if window_w >= search_w:
@@ -868,10 +1023,6 @@ def _detect_compact_liquid_ellipse_window(
                     continue
                 for local_y0 in range(0, search_h - window_h + 1, y_step):
                     local_y1 = local_y0 + window_h
-                    global_cy = (search_y0 + local_y0 + window_h * 0.5) / max(1, height)
-                    global_y1 = (search_y0 + local_y1) / max(1, height)
-                    vertical_score = _clamp01(1.0 - abs(global_cy - 0.77) / 0.24)
-                    bottom_score = _clamp01(1.0 - max(0.0, global_y1 - 0.90) / 0.10)
                     for local_x0 in range(0, search_w - window_w + 1, x_step):
                         local_x1 = local_x0 + window_w
                         area = window_w * window_h
@@ -884,36 +1035,99 @@ def _detect_compact_liquid_ellipse_window(
                         density = float(white_count) / max(1, area)
                         if density < 0.18:
                             continue
-                        global_cx = (search_x0 + local_x0 + window_w * 0.5) / max(1, width)
+                        global_x0 = search_x0 + local_x0
+                        global_y0 = search_y0 + local_y0
+                        global_x1 = search_x0 + local_x1
+                        global_y1 = search_y0 + local_y1
+                        global_cx = (global_x0 + global_x1) * 0.5 / max(1, width)
+                        global_cy = (global_y0 + global_y1) * 0.5 / max(1, height)
                         aspect = window_w / max(1, window_h)
                         center_score = _clamp01(1.0 - abs(global_cx - 0.50) / 0.32)
                         aspect_score = _clamp01(1.0 - abs(aspect - 2.0) / 2.20)
+                        expected_width = _clamp(0.05 + 0.29 * global_cy, 0.14, 0.34)
+                        expected_height = _clamp(0.04 + 0.18 * global_cy, 0.08, 0.22)
                         size_score = _clamp01(
                             1.0
                             - (
-                                abs(window_w / max(1, width) - 0.30) / 0.14
-                                + abs(window_h / max(1, height) - 0.17) / 0.10
+                                abs(window_w / max(1, width) - expected_width) / 0.15
+                                + abs(window_h / max(1, height) - expected_height) / 0.10
                             )
                             * 0.5
                         )
-                        ellipse_density, corner_density = _ellipse_window_density(
-                            search_mask[local_y0:local_y1, local_x0:local_x1]
+                        shaft_relation = _shaft_liquid_relation_score(
+                            shaft_x,
+                            shaft_score,
+                            global_x0,
+                            global_x1,
+                            width,
                         )
-                        ellipse_gain = _clamp01((ellipse_density - corner_density + 0.12) / 0.40)
-                        score = _clamp01(
-                            0.25 * density
-                            + 0.18 * ellipse_density
-                            + 0.16 * ellipse_gain
-                            + 0.20 * size_score
-                            + 0.06 * center_score
-                            + 0.08 * vertical_score
-                            + 0.07 * bottom_score
-                            + 0.03 * aspect_score
+                        coarse_score = _clamp01(
+                            0.42 * density
+                            + 0.22 * size_score
+                            + 0.16 * shaft_relation
+                            + 0.12 * center_score
+                            + 0.08 * aspect_score
                         )
-                        if best is None or score > best[0]:
-                            best = (score, local_x0, local_y0, local_x1, local_y1)
+                        coarse_candidates.append(
+                            (
+                                coarse_score,
+                                local_x0,
+                                local_y0,
+                                local_x1,
+                                local_y1,
+                                density,
+                                size_score,
+                                shaft_relation,
+                                center_score,
+                                aspect_score,
+                            )
+                        )
 
-    if best is None or best[0] < 0.35:
+        for (
+            _coarse_score,
+            local_x0,
+            local_y0,
+            local_x1,
+            local_y1,
+            density,
+            size_score,
+            shaft_relation,
+            center_score,
+            aspect_score,
+        ) in sorted(coarse_candidates, reverse=True)[:72]:
+            global_x0 = search_x0 + local_x0
+            global_y0 = search_y0 + local_y0
+            global_x1 = search_x0 + local_x1
+            global_y1 = search_y0 + local_y1
+            ellipse_density, corner_density = _ellipse_window_density(
+                search_mask[local_y0:local_y1, local_x0:local_x1]
+            )
+            ellipse_gain = _clamp01((ellipse_density - corner_density + 0.12) / 0.40)
+            label_penalty = _label_like_penalty(
+                hsv,
+                edges,
+                global_x0,
+                global_y0,
+                global_x1,
+                global_y1,
+            )
+            score = _clamp01(
+                0.27 * density
+                + 0.21 * ellipse_density
+                + 0.17 * ellipse_gain
+                + 0.16 * size_score
+                + 0.08 * shaft_relation
+                + 0.06 * center_score
+                + 0.05 * aspect_score
+                - 0.12 * label_penalty
+            )
+            candidates.append((score, local_x0, local_y0, local_x1, local_y1))
+
+    if not candidates:
+        return None
+
+    best = _select_compact_liquid_candidate(candidates, search_y0, width, height)
+    if best[0] < 0.35:
         return None
 
     score, local_x0, local_y0, local_x1, local_y1 = best
@@ -929,12 +1143,121 @@ def _detect_compact_liquid_ellipse_window(
         width,
         height,
     )
+    soft_mask = _soft_milky_liquid_mask(frame, cv2).astype(np.uint8)
+    refined_global = _refine_liquid_bounds_from_mask(
+        soft_mask,
+        milk_mask.astype(np.uint8),
+        hsv,
+        edges,
+        search_x0 + local_x0,
+        search_y0 + local_y0,
+        search_x0 + local_x1,
+        search_y0 + local_y1,
+        width,
+        height,
+        shaft_x=shaft_x,
+    )
+    global_x0, global_y0, global_x1, global_y1 = refined_global
     return (
-        float(search_x0 + local_x0),
-        float(search_y0 + local_y0),
-        float(search_x0 + local_x1),
-        float(search_y0 + local_y1),
+        float(global_x0),
+        float(global_y0),
+        float(global_x1),
+        float(global_y1),
         float(score),
+    )
+
+
+def _estimate_global_shaft_axis(
+    frame: np.ndarray,
+    edges: np.ndarray,
+    width: int,
+    height: int,
+    cv2,
+) -> tuple[float, float]:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    bright_mask = ((value >= 125) & (sat <= 95)).astype(np.uint8)
+    y0 = int(round(height * 0.08))
+    y1 = int(round(height * 0.62))
+    x0 = int(round(width * 0.18))
+    x1 = int(round(width * 0.82))
+    if y1 <= y0 + 2 or x1 <= x0 + 2:
+        return width * 0.5, 0.0
+
+    bright_col = bright_mask[y0:y1, x0:x1].mean(axis=0)
+    edge_col = (edges[y0:y1, x0:x1] > 0).mean(axis=0)
+    column_score = _smooth_1d(0.65 * bright_col + 0.35 * edge_col, max(9, width // 160))
+    if column_score.size == 0 or float(column_score.max()) <= 0.0:
+        return width * 0.5, 0.0
+
+    best_idx = int(np.argmax(column_score))
+    best_x = float(x0 + best_idx)
+    peak = float(column_score[best_idx])
+    contrast = peak - float(np.median(column_score))
+    score = _clamp01(contrast / 0.12)
+    hough_x, hough_score = _hough_shaft_x(edges, width, height, best_x)
+    if hough_x is not None and hough_score > 0.20:
+        best_x = float(0.70 * hough_x + 0.30 * best_x)
+        score = max(score, hough_score)
+    return best_x, score
+
+
+def _shaft_liquid_relation_score(
+    shaft_x: float,
+    shaft_score: float,
+    x0: int,
+    x1: int,
+    frame_width: int,
+) -> float:
+    window_width = max(1.0, float(x1 - x0))
+    center_x = 0.5 * (x0 + x1)
+    if x0 <= shaft_x <= x1:
+        overlap_score = 1.0
+    else:
+        distance = min(abs(shaft_x - x0), abs(shaft_x - x1))
+        overlap_score = _clamp01(1.0 - distance / max(1.0, window_width * 0.75))
+    center_score = _clamp01(1.0 - abs(center_x - shaft_x) / max(1.0, window_width * 0.75))
+    confidence = 0.50 + 0.50 * _clamp01(shaft_score)
+    return _clamp01(confidence * (0.65 * overlap_score + 0.35 * center_score))
+
+
+def _label_like_penalty(
+    hsv: np.ndarray,
+    edges: np.ndarray,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+) -> float:
+    crop_hsv = hsv[y0:y1, x0:x1]
+    crop_edges = edges[y0:y1, x0:x1]
+    if crop_hsv.size == 0 or crop_edges.size == 0:
+        return 0.0
+    hue = crop_hsv[:, :, 0]
+    sat = crop_hsv[:, :, 1]
+    value = crop_hsv[:, :, 2]
+    red_or_yellow = (hue <= 15) | ((hue >= 18) & (hue <= 45)) | (hue >= 165)
+    colored_density = float(((sat >= 80) & (value >= 90) & red_or_yellow).mean())
+    edge_density = float((crop_edges > 0).mean())
+    color_score = _clamp01((colored_density - 0.025) / 0.12)
+    edge_score = _clamp01((edge_density - 0.055) / 0.16)
+    return _clamp01(color_score * edge_score)
+
+
+def _select_compact_liquid_candidate(
+    candidates: list[tuple[float, int, int, int, int]],
+    search_y0: int,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[float, int, int, int, int]:
+    return max(
+        candidates,
+        key=lambda candidate: (
+            candidate[0],
+            -abs((search_y0 + candidate[2]) / max(1, frame_height) - 0.46),
+            candidate[3] - candidate[1],
+        ),
     )
 
 
@@ -1059,6 +1382,378 @@ def _milky_liquid_mask(frame: np.ndarray, cv2) -> np.ndarray:
     )
 
 
+def _soft_milky_liquid_mask(frame: np.ndarray, cv2) -> np.ndarray:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    r = frame[:, :, 0].astype(np.int16)
+    g = frame[:, :, 1].astype(np.int16)
+    b = frame[:, :, 2].astype(np.int16)
+    max_ch = np.maximum.reduce([r, g, b])
+    min_ch = np.minimum.reduce([r, g, b])
+    channel_span = max_ch - min_ch
+    milky = (
+        (value >= 105)
+        & (r >= 105)
+        & (g >= 95)
+        & (b >= 65)
+        & (sat <= 135)
+        & (channel_span <= 125)
+    )
+    pale_yellow_liquid = (
+        (value >= 125)
+        & (r >= 125)
+        & (g >= 110)
+        & (b >= 70)
+        & (hue >= 14)
+        & (hue <= 35)
+        & (sat <= 150)
+        & (channel_span <= 145)
+    )
+    return milky | pale_yellow_liquid
+
+
+def _refine_liquid_bounds_from_mask(
+    soft_mask: np.ndarray,
+    core_mask: np.ndarray,
+    hsv: np.ndarray,
+    edges: np.ndarray,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    frame_width: int,
+    frame_height: int,
+    shaft_x: float | None = None,
+) -> tuple[int, int, int, int]:
+    pad_x = int(round(frame_width * 0.035))
+    pad_y = int(round(frame_height * 0.055))
+    rx0 = max(0, x0 - pad_x)
+    rx1 = min(frame_width, x1 + pad_x)
+    ry0 = max(0, y0 - pad_y)
+    ry1 = min(frame_height, y1 + pad_y)
+    if rx1 <= rx0 + 2 or ry1 <= ry0 + 2:
+        return x0, y0, x1, y1
+
+    region = soft_mask[ry0:ry1, rx0:rx1].astype(np.uint8)
+    core_region = core_mask[ry0:ry1, rx0:rx1].astype(np.uint8)
+    combined = ((region > 0) | (core_region > 0)).astype(np.uint8)
+    if combined.size == 0 or float(combined.mean()) <= 0.02:
+        return x0, y0, x1, y1
+
+    column_density = _smooth_1d(combined.mean(axis=0), max(5, int(round(frame_width * 0.006))))
+    row_density = _smooth_1d(combined.mean(axis=1), max(5, int(round(frame_height * 0.006))))
+    if column_density.size == 0 or row_density.size == 0:
+        return x0, y0, x1, y1
+
+    local_x0 = max(0, x0 - rx0)
+    local_x1 = min(rx1 - rx0, x1 - rx0)
+    local_y0 = max(0, y0 - ry0)
+    local_y1 = min(ry1 - ry0, y1 - ry0)
+    col_threshold = max(0.10, float(column_density.max()) * 0.35)
+    row_threshold = max(0.10, float(row_density.max()) * 0.35)
+    active_cols = _active_span_touching(column_density >= col_threshold, local_x0, local_x1)
+    active_rows = _active_span_touching(row_density >= row_threshold, local_y0, local_y1)
+    if active_cols is None or active_rows is None:
+        return x0, y0, x1, y1
+
+    ax0, ax1 = active_cols
+    ay0, ay1 = active_rows
+    main_cols = _main_liquid_column_span(
+        combined,
+        local_y0,
+        local_y1,
+        ax0,
+        ax1,
+        shaft_x - rx0 if shaft_x is not None else None,
+        frame_width,
+    )
+    if main_cols is not None:
+        ax0, ax1 = main_cols
+    refined_x0 = rx0 + ax0 - int(round(frame_width * 0.008))
+    refined_x1 = rx0 + ax1 + int(round(frame_width * 0.008))
+    refined_y0 = ry0 + ay0 - int(round(frame_height * 0.006))
+    refined_y1 = ry0 + ay1 - int(round(frame_height * 0.006))
+
+    refined_x0 = int(_clamp(refined_x0, 0, frame_width - 2))
+    refined_x1 = int(_clamp(refined_x1, refined_x0 + 2, frame_width))
+    refined_y0 = int(_clamp(refined_y0, 0, frame_height - 2))
+    refined_y1 = int(_clamp(refined_y1, refined_y0 + 2, frame_height))
+    refined_x0, refined_y0, refined_x1, refined_y1 = _trim_label_like_bottom(
+        hsv,
+        edges,
+        refined_x0,
+        refined_y0,
+        refined_x1,
+        refined_y1,
+        frame_height,
+    )
+    refined_x0, refined_x1 = _trim_low_frame_liquid_width(
+        refined_x0,
+        refined_y0,
+        refined_x1,
+        refined_y1,
+        frame_width,
+        frame_height,
+        shaft_x=shaft_x,
+    )
+    refined_y1 = _trim_horizontal_rim_bottom(
+        edges,
+        refined_x0,
+        refined_y0,
+        refined_x1,
+        refined_y1,
+        frame_width,
+        frame_height,
+    )
+    refined_x0, refined_y0, refined_x1, refined_y1 = _trim_low_frame_bottom_drag(
+        refined_x0,
+        refined_y0,
+        refined_x1,
+        refined_y1,
+        frame_width,
+        frame_height,
+    )
+    min_width = max(2, int(round(frame_width * 0.08)))
+    min_height = max(2, int(round(frame_height * 0.04)))
+    if refined_x1 - refined_x0 < min_width or refined_y1 - refined_y0 < min_height:
+        return x0, y0, x1, y1
+    return refined_x0, refined_y0, refined_x1, refined_y1
+
+
+def _main_liquid_column_span(
+    combined_mask: np.ndarray,
+    local_y0: int,
+    local_y1: int,
+    fallback_x0: int,
+    fallback_x1: int,
+    shaft_x_local: float | None,
+    frame_width: int,
+) -> tuple[int, int] | None:
+    if combined_mask.size == 0:
+        return None
+    height, width = combined_mask.shape
+    if width <= 2 or height <= 2:
+        return None
+
+    local_y0 = int(_clamp(local_y0, 0, height - 1))
+    local_y1 = int(_clamp(local_y1, local_y0 + 1, height))
+    liquid_h = max(1, local_y1 - local_y0)
+    band_y0 = int(_clamp(local_y0 + liquid_h * 0.18, 0, height - 1))
+    band_y1 = int(_clamp(local_y0 + liquid_h * 0.72, band_y0 + 1, height))
+    band = combined_mask[band_y0:band_y1]
+    if band.size == 0:
+        return None
+
+    column_density = _smooth_1d(band.mean(axis=0), max(5, int(round(frame_width * 0.006))))
+    if column_density.size == 0 or float(column_density.max()) <= 0.0:
+        return None
+    active_runs = _active_runs(column_density >= max(0.10, float(column_density.max()) * 0.42))
+    if not active_runs:
+        return None
+
+    fallback_width = max(1, fallback_x1 - fallback_x0)
+    best: tuple[float, int, int] | None = None
+    min_width = max(3, int(round(frame_width * 0.14)))
+    for run_x0, run_x1 in active_runs:
+        if run_x1 - run_x0 < min_width:
+            continue
+        overlap = max(0, min(run_x1, fallback_x1) - max(run_x0, fallback_x0))
+        overlap_score = _clamp01(overlap / fallback_width)
+        if shaft_x_local is None:
+            shaft_score = overlap_score
+        elif run_x0 <= shaft_x_local <= run_x1:
+            shaft_score = 1.0
+        else:
+            distance = min(abs(shaft_x_local - run_x0), abs(shaft_x_local - run_x1))
+            shaft_score = _clamp01(1.0 - distance / max(1.0, fallback_width * 0.55))
+        density_score = float(column_density[run_x0:run_x1].mean())
+        width_score = _clamp01((run_x1 - run_x0) / max(1.0, frame_width * 0.18))
+        score = 0.42 * density_score + 0.28 * shaft_score + 0.20 * overlap_score + 0.10 * width_score
+        if best is None or score > best[0]:
+            best = (score, run_x0, run_x1)
+
+    if best is None:
+        return None
+    _, run_x0, run_x1 = best
+    return run_x0, run_x1
+
+
+def _active_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    active = np.flatnonzero(mask)
+    if active.size == 0:
+        return []
+    runs: list[tuple[int, int]] = []
+    start = int(active[0])
+    prev = int(active[0])
+    for value in active[1:]:
+        value = int(value)
+        if value == prev + 1:
+            prev = value
+            continue
+        runs.append((start, prev + 1))
+        start = prev = value
+    runs.append((start, prev + 1))
+    return runs
+
+
+def _trim_low_frame_liquid_width(
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    frame_width: int,
+    frame_height: int,
+    shaft_x: float | None = None,
+) -> tuple[int, int]:
+    top_norm = y0 / max(1, frame_height)
+    bottom_norm = y1 / max(1, frame_height)
+    width_norm = (x1 - x0) / max(1, frame_width)
+    if not (0.34 <= top_norm <= 0.74 and bottom_norm >= 0.47 and width_norm > 0.27):
+        return x0, x1
+
+    original_center = 0.5 * (x0 + x1)
+    if shaft_x is not None and x0 <= shaft_x <= x1:
+        shaft_weight = 0.65 if top_norm >= 0.52 else 0.50
+        center_x = shaft_weight * shaft_x + (1.0 - shaft_weight) * original_center
+    else:
+        center_x = original_center
+
+    max_width_norm = 0.26 if top_norm >= 0.52 else 0.28
+    max_width = frame_width * max_width_norm
+    trimmed_x0 = int(round(center_x - max_width * 0.5))
+    trimmed_x1 = int(round(center_x + max_width * 0.5))
+    trimmed_x0 = max(x0, int(_clamp(trimmed_x0, 0, frame_width - 2)))
+    trimmed_x1 = min(x1, int(_clamp(trimmed_x1, trimmed_x0 + 2, frame_width)))
+    if trimmed_x1 - trimmed_x0 < frame_width * 0.12:
+        return x0, x1
+    return trimmed_x0, trimmed_x1
+
+
+def _trim_horizontal_rim_bottom(
+    edges: np.ndarray,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    frame_width: int,
+    frame_height: int,
+) -> int:
+    height = y1 - y0
+    top_norm = y0 / max(1, frame_height)
+    bottom_norm = y1 / max(1, frame_height)
+    height_norm = height / max(1, frame_height)
+    if not (0.50 <= top_norm <= 0.74 and bottom_norm >= 0.80 and height_norm >= 0.20):
+        return y1
+
+    search_y0 = int(round(y0 + height * 0.46))
+    search_y1 = int(round(min(frame_height, y1 + frame_height * 0.035)))
+    if search_y1 <= search_y0 + 3 or x1 <= x0 + 3:
+        return y1
+
+    edge_crop = (edges[search_y0:search_y1, x0:x1] > 0).astype(float)
+    if edge_crop.size == 0:
+        return y1
+    row_score = _smooth_1d(edge_crop.mean(axis=1), max(7, int(round(frame_height * 0.006))))
+    if row_score.size == 0 or float(row_score.max()) <= 0.0:
+        return y1
+
+    threshold = max(
+        0.075,
+        float(np.median(row_score)) + 0.025,
+        float(row_score.max()) * 0.72,
+    )
+    active_rows = np.flatnonzero(row_score >= threshold)
+    if active_rows.size == 0:
+        return y1
+
+    rim_y = search_y0 + int(active_rows[0])
+    trim_pad = int(round(frame_height * 0.004))
+    trimmed_y1 = rim_y - trim_pad
+    if trimmed_y1 >= y1 - int(round(frame_height * 0.025)):
+        return y1
+    if trimmed_y1 - y0 < int(round(frame_height * 0.14)):
+        return y1
+    return int(_clamp(trimmed_y1, y0 + 2, y1))
+
+
+def _active_span_touching(mask: np.ndarray, local_start: int, local_end: int) -> tuple[int, int] | None:
+    active = np.flatnonzero(mask)
+    if active.size == 0:
+        return None
+    local_start = int(_clamp(local_start, 0, len(mask) - 1))
+    local_end = int(_clamp(local_end, local_start + 1, len(mask)))
+    touched = active[(active >= local_start) & (active < local_end)]
+    if touched.size == 0:
+        pivot = int(round(0.5 * (local_start + local_end)))
+        pivot = int(active[np.argmin(np.abs(active - pivot))])
+    else:
+        pivot = int(touched[len(touched) // 2])
+    left = pivot
+    right = pivot
+    while left > 0 and mask[left - 1]:
+        left -= 1
+    while right + 1 < len(mask) and mask[right + 1]:
+        right += 1
+    return left, right + 1
+
+
+def _trim_label_like_bottom(
+    hsv: np.ndarray,
+    edges: np.ndarray,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    frame_height: int,
+) -> tuple[int, int, int, int]:
+    height = y1 - y0
+    if height <= 4:
+        return x0, y0, x1, y1
+    bottom_start = y0 + int(round(height * 0.72))
+    crop_hsv = hsv[bottom_start:y1, x0:x1]
+    crop_edges = edges[bottom_start:y1, x0:x1]
+    if crop_hsv.size == 0 or crop_edges.size == 0:
+        return x0, y0, x1, y1
+    hue = crop_hsv[:, :, 0]
+    sat = crop_hsv[:, :, 1]
+    value = crop_hsv[:, :, 2]
+    red_or_yellow = (hue <= 15) | ((hue >= 18) & (hue <= 45)) | (hue >= 165)
+    colored_density = float(((sat >= 90) & (value >= 90) & red_or_yellow).mean())
+    edge_density = float((crop_edges > 0).mean())
+    if colored_density < 0.10 or edge_density < 0.08:
+        return x0, y0, x1, y1
+    trimmed_y1 = bottom_start + int(round(frame_height * 0.006))
+    if trimmed_y1 - y0 < frame_height * 0.04:
+        return x0, y0, x1, y1
+    return x0, y0, x1, int(_clamp(trimmed_y1, y0 + 2, y1))
+
+
+def _trim_low_frame_bottom_drag(
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[int, int, int, int]:
+    top_norm = y0 / max(1, frame_height)
+    bottom_norm = y1 / max(1, frame_height)
+    height_norm = (y1 - y0) / max(1, frame_height)
+    if not (0.56 <= top_norm <= 0.73 and bottom_norm >= 0.90 and height_norm >= 0.24):
+        return x0, y0, x1, y1
+
+    width_norm = (x1 - x0) / max(1, frame_width)
+    max_height_norm = _clamp(width_norm * 0.70, 0.14, 0.21)
+    trimmed_y1 = y0 + int(round(frame_height * max_height_norm))
+    if trimmed_y1 >= y1 - int(round(frame_height * 0.025)):
+        return x0, y0, x1, y1
+    if trimmed_y1 - y0 < int(round(frame_height * 0.08)):
+        return x0, y0, x1, y1
+    return x0, y0, x1, int(_clamp(trimmed_y1, y0 + 2, y1))
+
+
 def _ellipse_window_density(mask: np.ndarray) -> tuple[float, float]:
     height, width = mask.shape
     if height == 0 or width == 0:
@@ -1140,29 +1835,28 @@ def _roi_set_from_geometry(geometry: RoiGeometry, config: DetectionConfig, force
     height = geometry.frame_height
     bottle_left = _clamp(geometry.bottle_left_px, 0, width - 2)
     bottle_right = _clamp(geometry.bottle_right_px, bottle_left + 2, width)
-    bottle_width = max(1.0, bottle_right - bottle_left)
     bottle_bottom = _clamp(geometry.bottle_bottom_y_px, height * 0.55, height)
-    bottle_top = max(0.0, min(height * 0.34, geometry.rod_top_y_px))
-    bottle_height = max(1.0, bottle_bottom - bottle_top)
-    rod_y1 = min(bottle_bottom, height * 0.95)
-    legacy_liquid_y1 = rod_y1
-    legacy_liquid_y0 = max(bottle_top, height * 0.62, legacy_liquid_y1 - bottle_height * 0.36)
-    legacy_liquid_height = max(1.0, legacy_liquid_y1 - legacy_liquid_y0)
-    legacy_liquid_left = bottle_left + bottle_width * 0.02
-    legacy_liquid_right = bottle_left + bottle_width * 0.84
-    legacy_liquid_width = max(1.0, legacy_liquid_right - legacy_liquid_left)
     liquid_left = _clamp(geometry.liquid_x0_px, 0, width - 2)
     liquid_top = _clamp(geometry.liquid_y0_px, 0, height - 2)
     liquid_right = _clamp(geometry.liquid_x1_px, liquid_left + 2, width)
     liquid_bottom = _clamp(geometry.liquid_y1_px, liquid_top + 2, height)
-    roi_center_x = legacy_liquid_left + legacy_liquid_width * 0.48
-    rod_roi_width = max(geometry.shaft_width_px * 4.0, legacy_liquid_width * 0.45, width * 0.12)
-    rod_roi_width = min(rod_roi_width, legacy_liquid_width * 0.55, width * 0.18)
-    rod_y0 = max(height * 0.50, legacy_liquid_y0 - legacy_liquid_height * 0.26)
-    sparse_width = legacy_liquid_width * 0.40
-    sparse_height = legacy_liquid_height * 0.60
-    sparse_center_x = legacy_liquid_left + legacy_liquid_width * 0.40
-    sparse_cy = legacy_liquid_y0 + legacy_liquid_height * 0.49
+    liquid_width = max(1.0, liquid_right - liquid_left)
+    liquid_height = max(1.0, liquid_bottom - liquid_top)
+    liquid_center_x = 0.5 * (liquid_left + liquid_right)
+    shaft_x = _clamp(geometry.shaft_x_px, 0, width)
+    shaft_gap = max(liquid_left - shaft_x, shaft_x - liquid_right, 0.0)
+    shaft_center_ok = (
+        geometry.rod_axis_score >= 0.45
+        and shaft_gap <= max(liquid_width * 0.35, width * 0.03)
+    )
+    rod_center_x = shaft_x if shaft_center_ok else liquid_center_x
+    rod_roi_width = min(width * 0.18, max(width * 0.11, liquid_width * 0.48))
+    rod_y0 = max(0.0, liquid_top - liquid_height * 0.30)
+    rod_y1 = liquid_bottom
+    sparse_width = liquid_width * 0.45
+    sparse_height = liquid_height * 0.55
+    sparse_center_x = liquid_center_x
+    sparse_cy = liquid_top + liquid_height * 0.58
     liquid_roi = _rect_from_px(
         liquid_left,
         liquid_top,
@@ -1172,9 +1866,9 @@ def _roi_set_from_geometry(geometry: RoiGeometry, config: DetectionConfig, force
         height,
     )
     rod_roi = _rect_from_px(
-        roi_center_x - rod_roi_width * 0.5,
+        rod_center_x - rod_roi_width * 0.5,
         rod_y0,
-        roi_center_x + rod_roi_width * 0.5,
+        rod_center_x + rod_roi_width * 0.5,
         rod_y1,
         width,
         height,
@@ -1221,12 +1915,12 @@ def _roi_sanity_score(rois: RoiSet) -> float:
     lx0, ly0, lx1, ly1 = rois.liquid_roi
     sx0, sy0, sx1, sy1 = rois.sparse_roi
     checks.append(0.04 <= rx1 - rx0 <= 0.28)
-    checks.append(0.16 <= ry1 - ry0 <= 0.75)
+    checks.append(0.08 <= ry1 - ry0 <= 0.75)
     checks.append(0.15 <= lx1 - lx0 <= 0.85)
-    checks.append(0.12 <= ly1 - ly0 <= 0.50)
-    checks.append(0.08 <= sx1 - sx0 <= 0.45)
-    checks.append(0.08 <= sy1 - sy0 <= 0.45)
-    checks.append(ly0 >= 0.45 and ly1 >= ly0)
+    checks.append(0.06 <= ly1 - ly0 <= 0.50)
+    checks.append(0.04 <= sx1 - sx0 <= 0.45)
+    checks.append(0.035 <= sy1 - sy0 <= 0.45)
+    checks.append(0.28 <= ly0 <= 0.88 and ly1 >= ly0)
     checks.append(sy1 >= sy0 and ry1 >= ry0)
     checks.append(rx0 > 0.01 and rx1 < 0.99 and lx0 > 0.01 and lx1 < 0.99)
     if rois.source == "fixed" and rois.shaft_core_exclusion is not None:
@@ -1374,11 +2068,9 @@ def _confidence(metrics: FrameMetrics, config: DetectionConfig, candidate_ratio:
         rod_score = _clamp01(metrics.rod_wrap_ratio / max(1e-9, config.rod_wrap_ratio_min))
         connected_delta_min = max(config.connected_area_delta_ratio_min, metrics.baseline.connected_area_iqr)
         white_delta_min = max(0.04, 2.0 * metrics.baseline.white_coverage_iqr)
-        sparse_delta_min = max(0.05, 2.0 * metrics.baseline.sparse_hole_iqr)
         connected_delta_score = _clamp01((metrics.connected_area_delta_ratio or 0.0) / max(1e-9, connected_delta_min))
         white_delta_score = _clamp01((metrics.white_coverage_delta or 0.0) / max(1e-9, white_delta_min))
-        sparse_delta_score = _clamp01((metrics.sparse_hole_delta or 0.0) / max(1e-9, sparse_delta_min))
-        delta_score = 0.5 * connected_delta_score + 0.5 * max(white_delta_score, sparse_delta_score)
+        delta_score = 0.5 * connected_delta_score + 0.5 * white_delta_score
         connected_score = _clamp01(metrics.connected_area_ratio / max(1e-9, config.connected_area_ratio_min))
         return _clamp01(0.25 * roi_score + 0.25 * rod_score + 0.20 * delta_score + 0.15 * connected_score + 0.15 * stable_score)
     white_score = _clamp01((metrics.white_coverage - 0.45) / max(1e-9, config.white_coverage_min - 0.45))

@@ -145,12 +145,14 @@ def _write_overlay(frame_bgr, result: DetectionResult, path: Path) -> None:
     rois = evidence.get("rois") or {}
     colors = {
         "liquid_roi": (0, 180, 255),
-        "sparse_roi": (255, 0, 255),
         "rod_roi": (0, 255, 0),
         "shaft_core_exclusion": (0, 0, 255),
     }
     shaft_center_x = None
-    for name, rect in rois.items():
+    for name in ("liquid_roi", "rod_roi", "shaft_core_exclusion"):
+        rect = rois.get(name)
+        if not rect:
+            continue
         if len(rect) != 4:
             continue
         x0, y0, x1, y1 = _rect_px(rect, width, height)
@@ -183,4 +185,3 @@ def _rect_px(rect: list[float], width: int, height: int) -> tuple[int, int, int,
 
 if __name__ == "__main__":
     main()
-
