@@ -5,13 +5,16 @@ import numpy as np
 
 from polyv_detector import FINAL_GEL_ROD_CLIMBING, LIQUID_STIRRING
 from polyv_detector.detector import (
+    BaselineModel,
     DetectionConfig,
     DynamicRoiTracker,
+    FrameMetrics,
     GelClimbDetector,
     Rect,
     RoiSet,
     detect_frame,
 )
+from polyv_detector.dynamic_detector import _dynamic_final_candidate
 
 
 def dynamic_config(**kwargs):
@@ -32,6 +35,20 @@ def dynamic_config(**kwargs):
     )
     defaults.update(kwargs)
     return DetectionConfig(**defaults)
+
+
+def _paint(frame, rect, color):
+    height, width = frame.shape[:2]
+    x0, y0, x1, y1 = _rect_px(rect, width, height)
+    frame[y0:y1, x0:x1] = color
+
+
+def _rect_px(rect, width, height):
+    x0 = int(round(rect.x0 * width))
+    y0 = int(round(rect.y0 * height))
+    x1 = int(round(rect.x1 * width))
+    y1 = int(round(rect.y1 * height))
+    return x0, y0, x1, y1
 
 
 def synthetic_frame(width=480, height=270, shaft_x=240, gel=False, white_background=False):
@@ -177,6 +194,115 @@ def synthetic_pot_rim_frame(width=480, height=270, shaft_x=None):
     frame[rim_y - 2:rim_y + 2, rim_x0:rim_x1] = (236, 236, 228)
     frame[rim_y + 2:rim_y + 9, rim_x0:rim_x1] = (96, 94, 82)
     return frame
+
+
+ATTACHMENT_TEST_ROIS = RoiSet(
+    liquid_roi=Rect(0.30, 0.62, 0.72, 0.95),
+    sparse_roi=Rect(0.40, 0.68, 0.62, 0.90),
+    rod_roi=Rect(0.44, 0.30, 0.58, 0.92),
+    shaft_core_exclusion=None,
+    source="dynamic",
+    valid=True,
+    quality=1.0,
+)
+
+
+def attachment_base_frame(width=480, height=270):
+    frame = np.full((height, width, 3), (45, 45, 42), dtype=np.uint8)
+    _paint(frame, ATTACHMENT_TEST_ROIS.liquid_roi, (235, 228, 180))
+    return frame
+
+
+def attachment_frame_bottom_heavy(width=480, height=270):
+    frame = attachment_base_frame(width, height)
+    rx0, ry0, rx1, ry1 = _rect_px(ATTACHMENT_TEST_ROIS.rod_roi, width, height)
+    rod_h = ry1 - ry0
+    rod_w = rx1 - rx0
+    gap = max(1, int(round(rod_w * 0.10)))
+    flank_w = max(1, int(round(rod_w * 0.45)))
+    bottom_y0 = ry1 - int(round(rod_h * 0.35))
+    frame[bottom_y0:ry1, rx0:rx1] = (235, 228, 180)
+    frame[bottom_y0:ry1, max(0, rx0 - gap - flank_w):max(0, rx0 - gap)] = (45, 45, 42)
+    frame[bottom_y0:ry1, min(width, rx1 + gap):min(width, rx1 + gap + flank_w)] = (45, 45, 42)
+    return frame
+
+
+def attachment_frame_uniform_rod_and_flanks(width=480, height=270):
+    frame = attachment_base_frame(width, height)
+    rx0, ry0, rx1, ry1 = _rect_px(ATTACHMENT_TEST_ROIS.rod_roi, width, height)
+    rod_w = rx1 - rx0
+    gap = max(1, int(round(rod_w * 0.10)))
+    flank_w = max(1, int(round(rod_w * 0.45)))
+    frame[ry0:ry1, rx0:rx1] = (235, 228, 180)
+    frame[ry0:ry1, max(0, rx0 - gap - flank_w):max(0, rx0 - gap)] = (235, 228, 180)
+    frame[ry0:ry1, min(width, rx1 + gap):min(width, rx1 + gap + flank_w)] = (235, 228, 180)
+    return frame
+
+
+def attachment_frame_local_rod_bottom(width=480, height=270):
+    frame = attachment_base_frame(width, height)
+    rx0, ry0, rx1, ry1 = _rect_px(ATTACHMENT_TEST_ROIS.rod_roi, width, height)
+    rod_h = ry1 - ry0
+    bottom_y0 = ry1 - int(round(rod_h * 0.35))
+    frame[bottom_y0:ry1, rx0:rx1] = (235, 228, 180)
+    frame[bottom_y0:ry1, max(0, rx0 - 40):rx0 - 8] = (45, 45, 42)
+    frame[bottom_y0:ry1, rx1 + 8:min(width, rx1 + 40)] = (45, 45, 42)
+    frame[ry0:bottom_y0, rx0:rx1] = (45, 45, 42)
+    return frame
+
+
+def positive_attachment_ellipse_frame(width=480, height=270):
+    return synthetic_ellipse_frame(
+        width=width,
+        height=height,
+        liquid_center_x=0.50,
+        liquid_center_y=0.76,
+        liquid_radius_x=0.20,
+        liquid_radius_y=0.12,
+    )
+
+
+def final_candidate_metrics(**kwargs):
+    defaults = dict(
+        white_coverage=0.70,
+        rod_wrap_height_px=120,
+        rod_wrap_ratio=1.0,
+        connected_area_ratio=0.50,
+        rod_connection_score=True,
+        is_final_candidate=False,
+        rod_bottom_attachment_score=1.0,
+        rod_vertical_contrast=0.60,
+        rod_top_density=0.30,
+        rod_top_density_delta=0.10,
+        rod_shape_progress_score=1.0,
+        warm_material_coverage=0.0,
+        rod_warm_material_ratio=0.0,
+        rod_orange_maturity_ratio=0.0,
+        rod_orange_maturity_delta=0.0,
+        material_connected_area_ratio=0.0,
+        orange_material_path_score=0.0,
+        roi_source="dynamic",
+        roi_valid=True,
+        roi_quality=1.0,
+    )
+    defaults.update(kwargs)
+    return FrameMetrics(**defaults)
+
+
+def baseline_model():
+    return BaselineModel(
+        rod_wrap_ratio=1.0,
+        rod_wrap_iqr=0.0,
+        connected_area_ratio=0.5,
+        connected_area_iqr=0.0,
+        white_coverage=0.7,
+        white_coverage_iqr=0.0,
+        rod_top_density=0.20,
+        rod_top_density_iqr=0.0,
+        rod_orange_maturity_ratio=0.0,
+        rod_orange_maturity_iqr=0.0,
+        initial_final_like=False,
+    )
 
 
 class DynamicDetectorTests(unittest.TestCase):
@@ -374,6 +500,143 @@ class DynamicDetectorTests(unittest.TestCase):
         self.assertEqual(dynamic_metrics.rod_wrap_ratio, 1.0)
         self.assertEqual(fixed_metrics.rod_wrap_ratio, 0.0)
 
+    def test_rod_bottom_attachment_detects_bottom_heavy_wrap(self):
+        cfg = dynamic_config()
+        metrics = detect_frame(attachment_frame_bottom_heavy(), cfg, rois=ATTACHMENT_TEST_ROIS)
+
+        self.assertGreaterEqual(metrics.rod_bottom_attachment_score, 0.80)
+        self.assertGreater(metrics.rod_vertical_contrast, 0.50)
+        self.assertGreater(metrics.rod_bottom_density, metrics.rod_top_density)
+
+    def test_rod_bottom_attachment_rejects_uniform_white_rod_and_liquid(self):
+        cfg = dynamic_config()
+        metrics = detect_frame(attachment_frame_uniform_rod_and_flanks(), cfg, rois=ATTACHMENT_TEST_ROIS)
+
+        self.assertLess(metrics.rod_bottom_attachment_score, 0.30)
+        self.assertAlmostEqual(metrics.rod_bottom_density, metrics.rod_top_density, delta=0.01)
+        self.assertLess(metrics.rod_local_contrast, 0.05)
+
+    def test_rod_bottom_attachment_detects_local_rod_bottom_blob(self):
+        cfg = dynamic_config()
+        metrics = detect_frame(attachment_frame_local_rod_bottom(), cfg, rois=ATTACHMENT_TEST_ROIS)
+
+        self.assertGreaterEqual(metrics.rod_bottom_attachment_score, 0.80)
+        self.assertGreater(metrics.rod_local_contrast, 0.20)
+
+    def test_dynamic_final_candidate_waits_until_min_elapsed_time(self):
+        cfg = dynamic_config(dynamic_final_min_elapsed_sec=420.0)
+        metrics = final_candidate_metrics()
+        baseline = baseline_model()
+
+        self.assertFalse(_dynamic_final_candidate(metrics, baseline, cfg, 419.0))
+        self.assertTrue(_dynamic_final_candidate(metrics, baseline, cfg, 420.0))
+
+    def test_default_dynamic_final_candidate_has_no_elapsed_time_gate(self):
+        cfg = dynamic_config()
+        metrics = final_candidate_metrics()
+        baseline = baseline_model()
+
+        self.assertTrue(_dynamic_final_candidate(metrics, baseline, cfg, 0.0))
+
+    def test_dynamic_final_candidate_rejects_bottom_attachment_without_shape_progress(self):
+        cfg = dynamic_config()
+        metrics = final_candidate_metrics(
+            rod_vertical_contrast=0.15,
+            rod_top_density=0.22,
+            rod_top_density_delta=0.02,
+            rod_shape_progress_score=0.45,
+        )
+        baseline = baseline_model()
+
+        self.assertFalse(_dynamic_final_candidate(metrics, baseline, cfg, 120.0))
+
+    def test_dynamic_final_candidate_rejects_hollow_white_path(self):
+        cfg = dynamic_config()
+        metrics = final_candidate_metrics(
+            rod_bottom_attachment_score=1.0,
+            rod_vertical_contrast=0.60,
+            rod_top_density=0.22,
+            rod_top_density_delta=0.10,
+            rod_shape_progress_score=1.0,
+        )
+        baseline = baseline_model()
+
+        self.assertFalse(_dynamic_final_candidate(metrics, baseline, cfg, 120.0))
+
+    def test_dynamic_final_candidate_accepts_top_density_progress(self):
+        cfg = dynamic_config()
+        metrics = final_candidate_metrics(
+            rod_vertical_contrast=0.15,
+            rod_top_density=0.29,
+            rod_top_density_delta=0.09,
+            rod_shape_progress_score=1.0,
+        )
+        baseline = baseline_model()
+
+        self.assertTrue(_dynamic_final_candidate(metrics, baseline, cfg, 120.0))
+
+    def test_dynamic_final_candidate_accepts_orange_material_path(self):
+        cfg = dynamic_config()
+        metrics = final_candidate_metrics(
+            white_coverage=0.20,
+            connected_area_ratio=0.02,
+            rod_bottom_attachment_score=0.0,
+            rod_vertical_contrast=-0.20,
+            rod_shape_progress_score=0.0,
+            warm_material_coverage=0.72,
+            rod_warm_material_ratio=0.74,
+            rod_orange_maturity_ratio=0.54,
+            rod_orange_maturity_delta=0.54,
+            material_connected_area_ratio=0.62,
+            orange_material_path_score=1.0,
+        )
+        baseline = baseline_model()
+
+        self.assertTrue(_dynamic_final_candidate(metrics, baseline, cfg, 420.0))
+
+    def test_dynamic_final_candidate_rejects_immature_warm_material(self):
+        cfg = dynamic_config()
+        metrics = final_candidate_metrics(
+            white_coverage=0.20,
+            connected_area_ratio=0.02,
+            rod_bottom_attachment_score=0.0,
+            rod_vertical_contrast=-0.20,
+            rod_shape_progress_score=0.0,
+            warm_material_coverage=0.78,
+            rod_warm_material_ratio=0.77,
+            rod_orange_maturity_ratio=0.39,
+            rod_orange_maturity_delta=0.39,
+            material_connected_area_ratio=0.66,
+            orange_material_path_score=0.78,
+        )
+        baseline = baseline_model()
+
+        self.assertFalse(_dynamic_final_candidate(metrics, baseline, cfg, 420.0))
+
+    def test_dynamic_detector_alerts_after_attachment_is_stable_and_allowed(self):
+        cfg = dynamic_config(
+            calibration_duration_sec=2.0,
+            baseline_duration_sec=2.0,
+            metric_smooth_sec=0.1,
+            stable_duration_sec=3.0,
+            stable_min_ratio=0.8,
+            dynamic_final_min_elapsed_sec=4.0,
+            rod_bottom_attachment_score_min=0.60,
+            connected_area_ratio_min=0.05,
+            dynamic_white_coverage_min=0.30,
+            initial_final_white_coverage_min=1.1,
+        )
+        detector = GelClimbDetector(config=cfg)
+        result = None
+        for t in range(8):
+            result = detector.update(positive_attachment_ellipse_frame(), float(t))
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.state, FINAL_GEL_ROD_CLIMBING)
+        self.assertTrue(result.alert)
+        self.assertGreaterEqual(result.transition_time_sec, 7.0)
+        self.assertGreaterEqual(result.evidence["rod_bottom_attachment_score"], 0.60)
+
     def test_dynamic_detector_ignores_misaligned_white_background(self):
         cfg = dynamic_config(initial_final_white_coverage_min=1.1)
         detector = GelClimbDetector(config=cfg)
@@ -415,6 +678,7 @@ class DynamicDetectorTests(unittest.TestCase):
         self.assertEqual(result.evidence["rois"]["rod_roi"], calibrated_rod_roi)
         self.assertEqual(result.evidence["rois"]["liquid_roi"], calibrated_liquid_roi)
         self.assertNotIn("sparse_roi", result.evidence["rois"])
+        self.assertNotIn("sparse_hole_ratio", result.evidence)
 
     def test_liquid_roi_freezes_after_calibration_for_reliable_ellipse(self):
         cfg = dynamic_config(

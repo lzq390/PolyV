@@ -36,6 +36,14 @@ class DetectionConfig:
     white_min_red: int = 125
     white_min_green: int = 115
     white_min_blue: int = 70
+    warm_min_red: int = 145
+    warm_min_green: int = 105
+    warm_min_blue: int = 35
+    warm_min_red_blue_delta: int = 45
+    warm_min_green_blue_delta: int = 25
+    warm_max_red_green_delta: int = 95
+    orange_min_red_blue_delta: int = 75
+    orange_min_saturation: int = 60
     sparse_dark_value: int = 150
 
     white_coverage_min: float = 0.45
@@ -48,12 +56,30 @@ class DetectionConfig:
     connected_area_delta_ratio_min: float = 0.01
     dynamic_white_coverage_min: float = 0.40
     initial_final_white_coverage_min: float = 0.65
+    rod_bottom_attachment_score_min: float = 0.80
+    dynamic_final_min_elapsed_sec: float = 0.0
+    rod_vertical_contrast_min: float = 0.45
+    rod_white_path_top_density_min: float = 0.25
+    rod_top_density_delta_min: float = 0.08
+    rod_shape_progress_score_min: float = 1.0
+    warm_material_coverage_min: float = 0.60
+    rod_warm_material_ratio_min: float = 0.65
+    rod_orange_maturity_ratio_min: float = 0.50
+    rod_orange_maturity_delta_min: float = 0.25
+    warm_connected_area_ratio_min: float = 0.35
+    orange_material_path_score_min: float = 1.0
 
     stable_duration_sec: float = 60.0
     stable_min_ratio: float = 0.8
     window_time_tolerance_sec: float = 1.0
 
     bottom_seed_fraction: float = 0.35
+    rod_bottom_band_fraction: float = 0.35
+    rod_top_band_fraction: float = 0.30
+    rod_center_exclusion_fraction: float = 0.24
+    rod_flank_gap_ratio: float = 0.10
+    rod_flank_width_ratio: float = 0.45
+    rod_flank_bottom_density_max: float = 0.98
     sparse_component_stride: int = 2
     dynamic_roi_ema_alpha: float = 0.35
     dynamic_roi_update_interval_sec: float = 5.0
@@ -143,8 +169,10 @@ class BaselineModel:
     connected_area_iqr: float
     white_coverage: float
     white_coverage_iqr: float
-    sparse_hole_ratio: float
-    sparse_hole_iqr: float
+    rod_top_density: float
+    rod_top_density_iqr: float
+    rod_orange_maturity_ratio: float
+    rod_orange_maturity_iqr: float
     initial_final_like: bool
 
     def to_evidence(self) -> dict:
@@ -155,19 +183,48 @@ class BaselineModel:
             "baseline_connected_area_iqr": round(self.connected_area_iqr, 4),
             "baseline_white_coverage": round(self.white_coverage, 4),
             "baseline_white_coverage_iqr": round(self.white_coverage_iqr, 4),
+            "baseline_rod_top_density": round(self.rod_top_density, 4),
+            "baseline_rod_top_density_iqr": round(self.rod_top_density_iqr, 4),
+            "baseline_rod_orange_maturity_ratio": round(self.rod_orange_maturity_ratio, 4),
+            "baseline_rod_orange_maturity_iqr": round(self.rod_orange_maturity_iqr, 4),
             "initial_final_like": bool(self.initial_final_like),
         }
+
+
+class RodAttachmentMetrics(NamedTuple):
+    score: float
+    bottom_density: float
+    top_density: float
+    vertical_contrast: float
+    side_bottom_density: float
+    flank_bottom_density: float
+    local_contrast: float
 
 
 @dataclass(frozen=True)
 class FrameMetrics:
     white_coverage: float
-    sparse_hole_ratio: float
     rod_wrap_height_px: int
     rod_wrap_ratio: float
     connected_area_ratio: float
     rod_connection_score: bool
     is_final_candidate: bool
+    sparse_hole_ratio: float = 0.0
+    rod_bottom_attachment_score: float = 0.0
+    rod_bottom_density: float = 0.0
+    rod_top_density: float = 0.0
+    rod_vertical_contrast: float = 0.0
+    rod_side_bottom_density: float = 0.0
+    rod_flank_bottom_density: float = 0.0
+    rod_local_contrast: float = 0.0
+    rod_top_density_delta: float | None = None
+    rod_shape_progress_score: float = 0.0
+    warm_material_coverage: float = 0.0
+    rod_warm_material_ratio: float = 0.0
+    rod_orange_maturity_ratio: float = 0.0
+    rod_orange_maturity_delta: float | None = None
+    material_connected_area_ratio: float = 0.0
+    orange_material_path_score: float = 0.0
     roi_source: str = "fixed"
     roi_valid: bool = True
     roi_quality: float = 1.0
@@ -178,7 +235,6 @@ class FrameMetrics:
     rod_wrap_delta_ratio: float | None = None
     connected_area_delta_ratio: float | None = None
     white_coverage_delta: float | None = None
-    sparse_hole_delta: float | None = None
 
     def to_dict(self) -> dict:
         payload = {
@@ -186,6 +242,19 @@ class FrameMetrics:
             "rod_wrap_height_px": int(self.rod_wrap_height_px),
             "rod_wrap_ratio": round(float(self.rod_wrap_ratio), 4),
             "connected_area_ratio": round(float(self.connected_area_ratio), 4),
+            "rod_bottom_attachment_score": round(float(self.rod_bottom_attachment_score), 4),
+            "rod_bottom_density": round(float(self.rod_bottom_density), 4),
+            "rod_top_density": round(float(self.rod_top_density), 4),
+            "rod_vertical_contrast": round(float(self.rod_vertical_contrast), 4),
+            "rod_side_bottom_density": round(float(self.rod_side_bottom_density), 4),
+            "rod_flank_bottom_density": round(float(self.rod_flank_bottom_density), 4),
+            "rod_local_contrast": round(float(self.rod_local_contrast), 4),
+            "rod_shape_progress_score": round(float(self.rod_shape_progress_score), 4),
+            "warm_material_coverage": round(float(self.warm_material_coverage), 4),
+            "rod_warm_material_ratio": round(float(self.rod_warm_material_ratio), 4),
+            "rod_orange_maturity_ratio": round(float(self.rod_orange_maturity_ratio), 4),
+            "material_connected_area_ratio": round(float(self.material_connected_area_ratio), 4),
+            "orange_material_path_score": round(float(self.orange_material_path_score), 4),
             "rod_connection_score": bool(self.rod_connection_score),
             "is_final_candidate": bool(self.is_final_candidate),
             "roi_source": self.roi_source,
@@ -207,8 +276,10 @@ class FrameMetrics:
             payload["connected_area_delta_ratio"] = round(float(self.connected_area_delta_ratio), 4)
         if self.white_coverage_delta is not None:
             payload["white_coverage_delta"] = round(float(self.white_coverage_delta), 4)
-        if self.roi_source == "fixed" and self.sparse_hole_delta is not None:
-            payload["sparse_hole_delta"] = round(float(self.sparse_hole_delta), 4)
+        if self.rod_top_density_delta is not None:
+            payload["rod_top_density_delta"] = round(float(self.rod_top_density_delta), 4)
+        if self.rod_orange_maturity_delta is not None:
+            payload["rod_orange_maturity_delta"] = round(float(self.rod_orange_maturity_delta), 4)
         return payload
 
 
@@ -399,10 +470,10 @@ class GelClimbDetector:
         self._metric_window.append((timestamp_sec, raw_metrics))
         self._drop_old_metrics(timestamp_sec)
         metrics = _smooth_metrics([m for _, m in self._metric_window], raw_metrics)
-        metrics = _apply_baseline(metrics, self._baseline)
+        metrics = _apply_baseline(metrics, self._baseline, self.config)
         metrics = replace(
             metrics,
-            is_final_candidate=_dynamic_final_candidate(metrics, self._baseline, self.config),
+            is_final_candidate=_dynamic_final_candidate(metrics, self._baseline, self.config, timestamp_sec),
         )
         return self._update_stable_state(metrics, timestamp_sec)
 
@@ -481,12 +552,36 @@ def detect_frame(
     height, width = frame.shape[:2]
     rois = rois or _fixed_roi_set(config)
     white_mask = _white_gel_mask(frame, config)
+    material_mask = _material_gel_mask(frame, white_mask, config)
+    orange_mask = _orange_mature_mask(frame, material_mask, config)
     liquid_mask = _crop_bool(white_mask, rois.liquid_roi, width, height)
-    sparse_frame = _crop_rgb(frame, rois.sparse_roi, width, height)
-    sparse_white = _crop_bool(white_mask, rois.sparse_roi, width, height)
+    liquid_material_mask = _crop_bool(material_mask, rois.liquid_roi, width, height)
+    rod_material_mask = _crop_bool(material_mask, rois.rod_roi, width, height)
+    rod_orange_mask = _crop_bool(orange_mask, rois.rod_roi, width, height)
     white_coverage = _safe_ratio(liquid_mask.sum(), liquid_mask.size)
-    sparse_hole_ratio = _sparse_hole_ratio(sparse_frame, sparse_white, config)
+    warm_material_coverage = _safe_ratio(liquid_material_mask.sum(), liquid_material_mask.size)
+    rod_warm_material_ratio = _safe_ratio(rod_material_mask.sum(), rod_material_mask.size)
+    rod_orange_maturity_ratio = _safe_ratio(rod_orange_mask.sum(), rod_orange_mask.size)
+    sparse_hole_ratio = 0.0
+    if rois.source == "fixed":
+        sparse_frame = _crop_rgb(frame, rois.sparse_roi, width, height)
+        sparse_white = _crop_bool(white_mask, rois.sparse_roi, width, height)
+        sparse_hole_ratio = _sparse_hole_ratio(sparse_frame, sparse_white, config)
     rod_wrap_height, rod_wrap_ratio, connected_area_ratio = _rod_wrap_stats(
+        white_mask=white_mask,
+        frame_width=width,
+        frame_height=height,
+        rois=rois,
+        config=config,
+    )
+    _, _, material_connected_area_ratio = _rod_wrap_stats(
+        white_mask=material_mask,
+        frame_width=width,
+        frame_height=height,
+        rois=rois,
+        config=config,
+    )
+    rod_attachment = _rod_bottom_attachment_metrics(
         white_mask=white_mask,
         frame_width=width,
         frame_height=height,
@@ -498,8 +593,14 @@ def detect_frame(
         is_final_candidate = white_coverage >= config.white_coverage_min and rod_connection_score
     else:
         rod_connection_score = (
-            rod_wrap_ratio >= config.rod_wrap_ratio_min
-            and connected_area_ratio >= config.connected_area_ratio_min
+            (
+                rod_attachment.score >= config.rod_bottom_attachment_score_min
+                and connected_area_ratio >= config.connected_area_ratio_min
+            )
+            or (
+                rod_warm_material_ratio >= config.rod_warm_material_ratio_min
+                and material_connected_area_ratio >= config.warm_connected_area_ratio_min
+            )
         )
         is_final_candidate = False
     return FrameMetrics(
@@ -510,6 +611,17 @@ def detect_frame(
         connected_area_ratio=connected_area_ratio,
         rod_connection_score=rod_connection_score,
         is_final_candidate=is_final_candidate,
+        rod_bottom_attachment_score=rod_attachment.score,
+        rod_bottom_density=rod_attachment.bottom_density,
+        rod_top_density=rod_attachment.top_density,
+        rod_vertical_contrast=rod_attachment.vertical_contrast,
+        rod_side_bottom_density=rod_attachment.side_bottom_density,
+        rod_flank_bottom_density=rod_attachment.flank_bottom_density,
+        rod_local_contrast=rod_attachment.local_contrast,
+        warm_material_coverage=warm_material_coverage,
+        rod_warm_material_ratio=rod_warm_material_ratio,
+        rod_orange_maturity_ratio=rod_orange_maturity_ratio,
+        material_connected_area_ratio=material_connected_area_ratio,
         roi_source=rois.source,
         roi_valid=rois.valid,
         roi_quality=rois.quality,
@@ -527,41 +639,71 @@ def _build_baseline(metrics: list[FrameMetrics], rois: RoiSet, config: Detection
         connected_area_iqr=_iqr([m.connected_area_ratio for m in metrics]),
         white_coverage=_median([m.white_coverage for m in metrics]),
         white_coverage_iqr=_iqr([m.white_coverage for m in metrics]),
-        sparse_hole_ratio=_median([m.sparse_hole_ratio for m in metrics]),
-        sparse_hole_iqr=_iqr([m.sparse_hole_ratio for m in metrics]),
+        rod_top_density=_median([m.rod_top_density for m in metrics]),
+        rod_top_density_iqr=_iqr([m.rod_top_density for m in metrics]),
+        rod_orange_maturity_ratio=_median([m.rod_orange_maturity_ratio for m in metrics]),
+        rod_orange_maturity_iqr=_iqr([m.rod_orange_maturity_ratio for m in metrics]),
         initial_final_like=False,
     )
     return baseline
 
 
-def _apply_baseline(metrics: FrameMetrics, baseline: BaselineModel) -> FrameMetrics:
+def _apply_baseline(metrics: FrameMetrics, baseline: BaselineModel, config: DetectionConfig) -> FrameMetrics:
+    rod_top_density_delta = metrics.rod_top_density - baseline.rod_top_density
+    rod_orange_maturity_delta = metrics.rod_orange_maturity_ratio - baseline.rod_orange_maturity_ratio
     return replace(
         metrics,
         baseline=baseline,
         rod_wrap_delta_ratio=metrics.rod_wrap_ratio - baseline.rod_wrap_ratio,
         connected_area_delta_ratio=metrics.connected_area_ratio - baseline.connected_area_ratio,
         white_coverage_delta=metrics.white_coverage - baseline.white_coverage,
-        sparse_hole_delta=baseline.sparse_hole_ratio - metrics.sparse_hole_ratio,
+        rod_top_density_delta=rod_top_density_delta,
+        rod_shape_progress_score=_rod_shape_progress_score(metrics, baseline, config),
+        rod_orange_maturity_delta=rod_orange_maturity_delta,
+        orange_material_path_score=_orange_material_path_score(metrics, baseline, config),
     )
 
 
-def _dynamic_final_candidate(metrics: FrameMetrics, baseline: BaselineModel, config: DetectionConfig):
-    import operator
+def _rod_shape_progress_score(metrics: FrameMetrics, baseline: BaselineModel, config: DetectionConfig) -> float:
+    vertical_score = _clamp01(
+        metrics.rod_vertical_contrast / max(1e-9, config.rod_vertical_contrast_min)
+    )
+    top_density_delta = metrics.rod_top_density - baseline.rod_top_density
+    top_progress_score = _clamp01(
+        top_density_delta / max(1e-9, config.rod_top_density_delta_min)
+    )
+    return max(vertical_score, top_progress_score)
 
-    if (not metrics.roi_valid) or operator.lt(metrics.roi_quality, config.roi_quality_min):
+
+def _orange_material_path_score(metrics: FrameMetrics, baseline: BaselineModel, config: DetectionConfig) -> float:
+    orange_delta = metrics.rod_orange_maturity_ratio - baseline.rod_orange_maturity_ratio
+    scores = (
+        metrics.warm_material_coverage / max(1e-9, config.warm_material_coverage_min),
+        metrics.rod_warm_material_ratio / max(1e-9, config.rod_warm_material_ratio_min),
+        metrics.rod_orange_maturity_ratio / max(1e-9, config.rod_orange_maturity_ratio_min),
+        orange_delta / max(1e-9, config.rod_orange_maturity_delta_min),
+        metrics.material_connected_area_ratio / max(1e-9, config.warm_connected_area_ratio_min),
+    )
+    return min(_clamp01(score) for score in scores)
+
+
+def _dynamic_final_candidate(
+    metrics: FrameMetrics,
+    baseline: BaselineModel,
+    config: DetectionConfig,
+    timestamp_sec: float,
+):
+    if (not metrics.roi_valid) or metrics.roi_quality < config.roi_quality_min:
         return False
-    connected_delta_min = max(config.connected_area_delta_ratio_min, baseline.connected_area_iqr)
-    white_delta_min = max(0.04, 2.0 * baseline.white_coverage_iqr)
-    white_delta = metrics.white_coverage_delta or 0.0
-    connected_delta = metrics.connected_area_delta_ratio or 0.0
-    appearance_delta_ok = operator.ge(white_delta, white_delta_min)
-    return (
-        operator.ge(metrics.rod_wrap_ratio, config.rod_wrap_ratio_min)
-        and operator.ge(metrics.connected_area_ratio, config.connected_area_ratio_min)
-        and operator.ge(connected_delta, connected_delta_min)
-        and appearance_delta_ok
-        and operator.ge(metrics.white_coverage, config.dynamic_white_coverage_min)
+    white_path = (
+        metrics.rod_bottom_attachment_score >= config.rod_bottom_attachment_score_min
+        and metrics.rod_shape_progress_score >= config.rod_shape_progress_score_min
+        and metrics.rod_top_density >= config.rod_white_path_top_density_min
+        and metrics.connected_area_ratio >= config.connected_area_ratio_min
+        and metrics.white_coverage >= config.dynamic_white_coverage_min
     )
+    orange_path = metrics.orange_material_path_score >= config.orange_material_path_score_min
+    return timestamp_sec >= config.dynamic_final_min_elapsed_sec and (white_path or orange_path)
 
 
 def _smooth_metrics(metrics: list[FrameMetrics], latest: FrameMetrics) -> FrameMetrics:
@@ -570,10 +712,20 @@ def _smooth_metrics(metrics: list[FrameMetrics], latest: FrameMetrics) -> FrameM
     return replace(
         latest,
         white_coverage=_median([m.white_coverage for m in metrics]),
-        sparse_hole_ratio=_median([m.sparse_hole_ratio for m in metrics]),
         rod_wrap_height_px=int(round(_median([m.rod_wrap_height_px for m in metrics]))),
         rod_wrap_ratio=_median([m.rod_wrap_ratio for m in metrics]),
         connected_area_ratio=_median([m.connected_area_ratio for m in metrics]),
+        rod_bottom_attachment_score=_median([m.rod_bottom_attachment_score for m in metrics]),
+        rod_bottom_density=_median([m.rod_bottom_density for m in metrics]),
+        rod_top_density=_median([m.rod_top_density for m in metrics]),
+        rod_vertical_contrast=_median([m.rod_vertical_contrast for m in metrics]),
+        rod_side_bottom_density=_median([m.rod_side_bottom_density for m in metrics]),
+        rod_flank_bottom_density=_median([m.rod_flank_bottom_density for m in metrics]),
+        rod_local_contrast=_median([m.rod_local_contrast for m in metrics]),
+        warm_material_coverage=_median([m.warm_material_coverage for m in metrics]),
+        rod_warm_material_ratio=_median([m.rod_warm_material_ratio for m in metrics]),
+        rod_orange_maturity_ratio=_median([m.rod_orange_maturity_ratio for m in metrics]),
+        material_connected_area_ratio=_median([m.material_connected_area_ratio for m in metrics]),
         roi_quality=_median([m.roi_quality for m in metrics]),
     )
 
@@ -1987,6 +2139,74 @@ def _rod_wrap_stats(
     return height_px, _safe_ratio(height_px, rod_mask.shape[0]), _safe_ratio(connected.sum(), connected.size)
 
 
+def _rod_bottom_attachment_metrics(
+    white_mask: np.ndarray,
+    frame_width: int,
+    frame_height: int,
+    rois: RoiSet,
+    config: DetectionConfig,
+) -> RodAttachmentMetrics:
+    rx0, ry0, rx1, ry1 = _rect_px(rois.rod_roi, frame_width, frame_height)
+    rod_mask = white_mask[ry0:ry1, rx0:rx1]
+    rod_height, rod_width = rod_mask.shape
+    if rod_height == 0 or rod_width == 0:
+        return RodAttachmentMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    bottom_fraction = _clamp(config.rod_bottom_band_fraction, 0.01, 1.0)
+    top_fraction = _clamp(config.rod_top_band_fraction, 0.01, 1.0)
+    bottom_rows = max(1, int(round(rod_height * bottom_fraction)))
+    top_rows = max(1, int(round(rod_height * top_fraction)))
+    bottom_band = rod_mask[-bottom_rows:]
+    top_band = rod_mask[:top_rows]
+
+    bottom_density = _safe_ratio(bottom_band.sum(), bottom_band.size)
+    top_density = _safe_ratio(top_band.sum(), top_band.size)
+    vertical_contrast = bottom_density - top_density
+
+    side_bottom = bottom_band.copy()
+    center_fraction = _clamp(config.rod_center_exclusion_fraction, 0.0, 0.95)
+    center_width = int(round(rod_width * center_fraction))
+    if center_width > 0:
+        center_x0 = max(0, (rod_width - center_width) // 2)
+        center_x1 = min(rod_width, center_x0 + center_width)
+        side_bottom[:, center_x0:center_x1] = False
+    side_bottom_density = _safe_ratio(side_bottom.sum(), side_bottom.size)
+
+    gap_px = max(1, int(round(rod_width * _clamp(config.rod_flank_gap_ratio, 0.0, 2.0))))
+    flank_width_px = max(1, int(round(rod_width * _clamp(config.rod_flank_width_ratio, 0.01, 2.0))))
+    flank_y0 = ry1 - bottom_rows
+    flank_y1 = ry1
+    flanks = []
+    left_x1 = max(0, rx0 - gap_px)
+    left_x0 = max(0, left_x1 - flank_width_px)
+    if left_x1 > left_x0:
+        flanks.append(white_mask[flank_y0:flank_y1, left_x0:left_x1])
+    right_x0 = min(frame_width, rx1 + gap_px)
+    right_x1 = min(frame_width, right_x0 + flank_width_px)
+    if right_x1 > right_x0:
+        flanks.append(white_mask[flank_y0:flank_y1, right_x0:right_x1])
+    if flanks:
+        flank_bottom = np.concatenate(flanks, axis=1)
+        flank_bottom_density = _safe_ratio(flank_bottom.sum(), flank_bottom.size)
+    else:
+        flank_bottom_density = side_bottom_density
+
+    local_contrast = side_bottom_density - flank_bottom_density
+    flank_saturated = flank_bottom_density > _clamp(config.rod_flank_bottom_density_max, 0.0, 1.0)
+    vertical_score = 0.0 if flank_saturated else _clamp01(vertical_contrast / 0.55)
+    local_score = _clamp01(local_contrast / 0.20)
+    score = max(vertical_score, local_score)
+    return RodAttachmentMetrics(
+        score=score,
+        bottom_density=bottom_density,
+        top_density=top_density,
+        vertical_contrast=vertical_contrast,
+        side_bottom_density=side_bottom_density,
+        flank_bottom_density=flank_bottom_density,
+        local_contrast=local_contrast,
+    )
+
+
 def _white_gel_mask(frame: np.ndarray, config: DetectionConfig) -> np.ndarray:
     r = frame[:, :, 0].astype(np.int16)
     g = frame[:, :, 1].astype(np.int16)
@@ -2000,6 +2220,38 @@ def _white_gel_mask(frame: np.ndarray, config: DetectionConfig) -> np.ndarray:
         & (r >= config.white_min_red)
         & (g >= config.white_min_green)
         & (b >= config.white_min_blue)
+    )
+
+
+def _material_gel_mask(frame: np.ndarray, white_mask: np.ndarray, config: DetectionConfig) -> np.ndarray:
+    r = frame[:, :, 0].astype(np.int16)
+    g = frame[:, :, 1].astype(np.int16)
+    b = frame[:, :, 2].astype(np.int16)
+    warm_mask = (
+        (r >= config.warm_min_red)
+        & (g >= config.warm_min_green)
+        & (b >= config.warm_min_blue)
+        & ((r - b) >= config.warm_min_red_blue_delta)
+        & ((g - b) >= config.warm_min_green_blue_delta)
+        & ((r - g) <= config.warm_max_red_green_delta)
+    )
+    return white_mask | warm_mask
+
+
+def _orange_mature_mask(frame: np.ndarray, material_mask: np.ndarray, config: DetectionConfig) -> np.ndarray:
+    r = frame[:, :, 0].astype(np.int16)
+    g = frame[:, :, 1].astype(np.int16)
+    b = frame[:, :, 2].astype(np.int16)
+    max_ch = np.maximum.reduce([r, g, b])
+    min_ch = np.minimum.reduce([r, g, b])
+    saturation = np.zeros_like(max_ch, dtype=np.float32)
+    positive = max_ch > 0
+    saturation[positive] = (max_ch[positive] - min_ch[positive]) / max_ch[positive] * 255.0
+    return (
+        material_mask
+        & ((r - b) >= config.orange_min_red_blue_delta)
+        & (saturation >= config.orange_min_saturation)
+        & (g >= config.warm_min_green)
     )
 
 
@@ -2065,14 +2317,35 @@ def _confidence(metrics: FrameMetrics, config: DetectionConfig, candidate_ratio:
     stable_score = _clamp01(candidate_ratio / max(1e-9, config.stable_min_ratio))
     if metrics.baseline is not None:
         roi_score = _clamp01(metrics.roi_quality / max(1e-9, config.roi_quality_min))
-        rod_score = _clamp01(metrics.rod_wrap_ratio / max(1e-9, config.rod_wrap_ratio_min))
-        connected_delta_min = max(config.connected_area_delta_ratio_min, metrics.baseline.connected_area_iqr)
-        white_delta_min = max(0.04, 2.0 * metrics.baseline.white_coverage_iqr)
-        connected_delta_score = _clamp01((metrics.connected_area_delta_ratio or 0.0) / max(1e-9, connected_delta_min))
-        white_delta_score = _clamp01((metrics.white_coverage_delta or 0.0) / max(1e-9, white_delta_min))
-        delta_score = 0.5 * connected_delta_score + 0.5 * white_delta_score
-        connected_score = _clamp01(metrics.connected_area_ratio / max(1e-9, config.connected_area_ratio_min))
-        return _clamp01(0.25 * roi_score + 0.25 * rod_score + 0.20 * delta_score + 0.15 * connected_score + 0.15 * stable_score)
+        attachment_score = _clamp01(
+            metrics.rod_bottom_attachment_score / max(1e-9, config.rod_bottom_attachment_score_min)
+        )
+        shape_score = _clamp01(
+            metrics.rod_shape_progress_score / max(1e-9, config.rod_shape_progress_score_min)
+        )
+        top_fill_score = _clamp01(
+            metrics.rod_top_density / max(1e-9, config.rod_white_path_top_density_min)
+        )
+        white_path_score = min(attachment_score, shape_score, top_fill_score)
+        orange_path_score = _clamp01(
+            metrics.orange_material_path_score / max(1e-9, config.orange_material_path_score_min)
+        )
+        path_score = max(white_path_score, orange_path_score)
+        connected_score = max(
+            _clamp01(metrics.connected_area_ratio / max(1e-9, config.connected_area_ratio_min)),
+            _clamp01(metrics.material_connected_area_ratio / max(1e-9, config.warm_connected_area_ratio_min)),
+        )
+        coverage_score = max(
+            _clamp01(metrics.white_coverage / max(1e-9, config.dynamic_white_coverage_min)),
+            _clamp01(metrics.warm_material_coverage / max(1e-9, config.warm_material_coverage_min)),
+        )
+        return _clamp01(
+            0.25 * roi_score
+            + 0.30 * path_score
+            + 0.15 * connected_score
+            + 0.15 * coverage_score
+            + 0.15 * stable_score
+        )
     white_score = _clamp01((metrics.white_coverage - 0.45) / max(1e-9, config.white_coverage_min - 0.45))
     sparse_score = _clamp01((0.12 - metrics.sparse_hole_ratio) / max(1e-9, 0.12 - config.sparse_hole_ratio_max))
     rod_score = _clamp01((metrics.rod_wrap_height_px - 50) / max(1e-9, config.rod_wrap_height_min_px - 50))
